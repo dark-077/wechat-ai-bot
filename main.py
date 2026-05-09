@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 
 from fastapi import FastAPI, Request, Query
 from fastapi.responses import PlainTextResponse, Response
-from anthropic import AsyncAnthropic
+from openai import AsyncOpenAI
 from dotenv import load_dotenv
 import httpx
 
@@ -16,17 +16,23 @@ load_dotenv()
 app = FastAPI()
 
 WECHAT_TOKEN = os.getenv("WECHAT_TOKEN", "")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 
-client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-
-MODEL = "claude-sonnet-4-6"
-
-SYSTEM_PROMPT = (
-    "你是一个有用、友好的AI助手，运行在微信公众号中。"
-    "用中文回答，简洁明了。"
-    "如果用户发来图片，请详细描述图片内容或回答用户关于图片的问题。"
+client = AsyncOpenAI(
+    api_key=DEEPSEEK_API_KEY,
+    base_url="https://api.deepseek.com",
 )
+
+MODEL = "deepseek-chat"
+
+SYSTEM_PROMPT = {
+    "role": "system",
+    "content": (
+        "你是一个有用、友好的AI助手，运行在微信公众号中。"
+        "用中文回答，简洁明了。"
+        "如果用户发来图片，请详细描述图片内容或回答用户关于图片的问题。"
+    ),
+}
 
 # ========== 多轮对话记忆 ==========
 MEMORY_TTL = timedelta(minutes=30)
@@ -89,27 +95,23 @@ async def download_image(url: str) -> bytes:
 def image_to_vision_block(image_data: bytes) -> dict:
     b64 = base64.b64encode(image_data).decode("utf-8")
     return {
-        "type": "image",
-        "source": {
-            "type": "base64",
-            "media_type": "image/jpeg",
-            "data": b64,
-        },
+        "type": "image_url",
+        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
     }
 
 
-# ========== Claude API 调用 ==========
-async def call_claude(session: dict, user_content) -> str:
-    api_messages = list(session["messages"])
+# ========== DeepSeek API 调用 ==========
+async def call_ai(session: dict, user_content) -> str:
+    api_messages = [SYSTEM_PROMPT]
+    api_messages += session["messages"]
     api_messages.append({"role": "user", "content": user_content})
 
-    resp = await client.messages.create(
+    resp = await client.chat.completions.create(
         model=MODEL,
         max_tokens=1024,
-        system=SYSTEM_PROMPT,
         messages=api_messages,
     )
-    return resp.content[0].text
+    return resp.choices[0].message.content or ""
 
 
 # ========== 路由 ==========
@@ -147,7 +149,7 @@ async def handle_message(request: Request):
             reply = "请发送文字消息。"
         else:
             try:
-                reply = await call_claude(session, user_text)
+                reply = await call_ai(session, user_text)
                 save_turn(session, "user", user_text)
                 save_turn(session, "assistant", reply)
             except Exception:
@@ -165,7 +167,7 @@ async def handle_message(request: Request):
                     vision_block,
                     {"type": "text", "text": "请描述这张图片的内容"},
                 ]
-                reply = await call_claude(session, user_content)
+                reply = await call_ai(session, user_content)
                 save_turn(session, "user", user_content)
                 save_turn(session, "assistant", reply)
             except Exception:
