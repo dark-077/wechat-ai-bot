@@ -5,34 +5,25 @@ import xml.etree.ElementTree as ET
 import os
 from datetime import datetime, timedelta
 
-from fastapi import FastAPI, Request, Query
-from fastapi.responses import PlainTextResponse, Response
-from openai import AsyncOpenAI
+from flask import Flask, request, Response
 from dotenv import load_dotenv
 import httpx
 
 load_dotenv()
 
-app = FastAPI()
+app = Flask(__name__)
 
 WECHAT_TOKEN = os.getenv("WECHAT_TOKEN", "")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 
-client = AsyncOpenAI(
-    api_key=DEEPSEEK_API_KEY,
-    base_url="https://api.deepseek.com",
-)
-
+DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 MODEL = "deepseek-chat"
 
-SYSTEM_PROMPT = {
-    "role": "system",
-    "content": (
-        "你是一个有用、友好的AI助手，运行在微信公众号中。"
-        "用中文回答，简洁明了。"
-        "如果用户发来图片，请详细描述图片内容或回答用户关于图片的问题。"
-    ),
-}
+SYSTEM_PROMPT = (
+    "你是一个有用、友好的AI助手，运行在微信公众号中。"
+    "用中文回答，简洁明了。"
+    "如果用户发来图片，请详细描述图片内容或回答用户关于图片的问题。"
+)
 
 # ========== 多轮对话记忆 ==========
 MEMORY_TTL = timedelta(minutes=30)
@@ -85,11 +76,10 @@ def build_reply_xml(to_user: str, from_user: str, content: str) -> str:
 
 
 # ========== 图片处理 ==========
-async def download_image(url: str) -> bytes:
-    async with httpx.AsyncClient(timeout=15) as http_client:
-        resp = await http_client.get(url)
-        resp.raise_for_status()
-        return resp.content
+def download_image(url: str) -> bytes:
+    resp = httpx.get(url, timeout=15)
+    resp.raise_for_status()
+    return resp.content
 
 
 def image_to_vision_block(image_data: bytes) -> dict:
@@ -101,35 +91,45 @@ def image_to_vision_block(image_data: bytes) -> dict:
 
 
 # ========== DeepSeek API 调用 ==========
-async def call_ai(session: dict, user_content) -> str:
-    api_messages = [SYSTEM_PROMPT]
+def call_ai(session: dict, user_content) -> str:
+    api_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     api_messages += session["messages"]
     api_messages.append({"role": "user", "content": user_content})
 
-    resp = await client.chat.completions.create(
-        model=MODEL,
-        max_tokens=1024,
-        messages=api_messages,
+    resp = httpx.post(
+        DEEPSEEK_URL,
+        headers={
+            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": MODEL,
+            "max_tokens": 1024,
+            "messages": api_messages,
+        },
+        timeout=30,
     )
-    return resp.choices[0].message.content or ""
+    resp.raise_for_status()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"] or ""
 
 
 # ========== 路由 ==========
-@app.get("/wechat")
-async def verify_server(
-    signature: str = Query(...),
-    timestamp: str = Query(...),
-    nonce: str = Query(...),
-    echostr: str = Query(...),
-):
+@app.route("/wechat", methods=["GET"])
+def verify_server():
+    signature = request.args.get("signature", "")
+    timestamp = request.args.get("timestamp", "")
+    nonce = request.args.get("nonce", "")
+    echostr = request.args.get("echostr", "")
+
     if verify_signature(signature, timestamp, nonce):
-        return PlainTextResponse(echostr)
-    return PlainTextResponse("fail", status_code=403)
+        return Response(echostr, content_type="text/plain")
+    return Response("fail", status=403, content_type="text/plain")
 
 
-@app.post("/wechat")
-async def handle_message(request: Request):
-    body = await request.body()
+@app.route("/wechat", methods=["POST"])
+def handle_message():
+    body = request.data
     msg = parse_wechat_xml(body)
 
     from_user = msg.get("FromUserName", "")
@@ -149,7 +149,7 @@ async def handle_message(request: Request):
             reply = "请发送文字消息。"
         else:
             try:
-                reply = await call_ai(session, user_text)
+                reply = call_ai(session, user_text)
                 save_turn(session, "user", user_text)
                 save_turn(session, "assistant", reply)
             except Exception:
@@ -161,13 +161,13 @@ async def handle_message(request: Request):
             reply = "无法获取图片链接。"
         else:
             try:
-                image_data = await download_image(pic_url)
+                image_data = download_image(pic_url)
                 vision_block = image_to_vision_block(image_data)
                 user_content = [
                     vision_block,
                     {"type": "text", "text": "请描述这张图片的内容"},
                 ]
-                reply = await call_ai(session, user_content)
+                reply = call_ai(session, user_content)
                 save_turn(session, "user", user_content)
                 save_turn(session, "assistant", reply)
             except Exception:
@@ -177,11 +177,11 @@ async def handle_message(request: Request):
         reply = "暂不支持此类型消息，请发文字或图片。"
 
     if not reply:
-        return Response(content="success")
+        return Response("success")
 
-    return Response(content=build_reply_xml(from_user, to_user, reply), media_type="application/xml")
+    return Response(build_reply_xml(from_user, to_user, reply), content_type="application/xml")
 
 
-@app.get("/health")
-async def health():
+@app.route("/health")
+def health():
     return {"status": "ok"}
